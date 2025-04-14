@@ -1,0 +1,551 @@
+---
+title: "Forecasting SAF Production"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Nikhita Kalluri
+
+### NASA Glenn Research Center, Graphics and Visualization Lab
+
+# Abstract
+
+Sustainable Aviation Fuels (SAFs) have been traditionally explored as a pathway to achieving net-zero emissions, as they can be blended with Jet A fuel to reduce carbon emissions. This is increasingly important with the onset of climate change as well as with the projected fuel growth in the aviation sector. Utilizing the Environmental Protection Agency’s Public Data for the Renewable Fuel Standard: RINs Generated Transactions dataset, which provided data on historical data on SAF production, this study aims to forecast future SAF productions by taking into account past trends.
+
+The analysis incorporates the assessment of the need for time series transformations, such as Box-Cox and log transformations, and incorporates seasonal and trend differencing to achieve stationarity of data. Multiple SARIMA models are fitted for forecasting, with model selection guided by the Akaike Information Criterion (AICc).
+
+The chosen model, SARIMA(1,1,2)(1,1,1)12, was tested for normality through the process of diagnostic checking. It exhibits invertibility and successfully passes normality tests, qualifying it for forecasting.
+
+It's important to acknowledge that the complexity of the data, influenced by factors like the inherent variability of SAF production to its dependence on a wider range of factors including public demand and regulatory factors, technological advancements, policy changes, and economic factors, introduces nuances into the data. Consequently, deviations from the general predicted trend may occur. As a result of this, the final model may slightly deviate from the observations in the actual dataset, although the confidence intervals effectively encompass the values. The chosen final model was:
+
+$$
+(1 - 0.4568{(0.1095)}B + 0.0831{(0.1009)}B^2)(1 + 0.0663{(0.1460)}B^{12})Y_t = (1 + 1.8813{(0.0587)}B - 0.8925{(0.0579)}B^2)(1 + 0.7514{(0.1443)}B^{12})Z_t
+$$
+
+$$sigma^2 = 0.01118$$
+
+# Introduction
+
+In the context of global warming and the increasing demand for fuel in the aviation sector, it is critical to explore more sustainable and cleaner methods of fuel production. SAFs present a viable means of transition toward reducing aviation's carbon footprint. However, SAFs are not entirely emission-free, as they require blending with conventional Jet Fuel A and generate emissions during feedstock production and other processing stages. Despite these limitations, SAFs play a pivotal role in the aviation industry's move toward sustainability.
+
+This project utilizes the Environmental Protection Agency’s (EPA) Public Data for the Renewable Fuel Standard: RINs Generated Transactions dataset. Specifically, the focus is on the production volume of SAFs (measured in gallons) on a monthly basis. Among the various fuel categories in the dataset, we are particularly interested in Non-Ester Renewable Diesel (Energy Value: 1.7). 
+
+By filtering the dataset to isolate this fuel type, we aim to analyze and forecast future trends in SAF production. Key metrics include the average monthly production volume and its annual aggregation, providing insights into production trends over time. These projections are critical for understanding the potential trajectory of SAF adoption and its implications for sustainable aviation.
+
+# Methods
+
+## Read in Data
+
+To start, the dataset is imported as a CSV file. Since the dataset contains multiple observations per year, with data separated by months, we need to consolidate it. To achieve this, a new 'Date' variable is created, and the data is grouped by this variable to calculate the mean observation for each year. This results in a new dataframe with a single averaged observation per year. Once this transformation is complete, the dataframe is converted into a time series object for further analysis.
+
+```{r include=FALSE}
+# import necessary libraries
+library(dplyr)
+library(stringr)
+library(xts)
+library(tidyr)
+library(astsa)
+library(na.tools)
+library(MASS)
+library(ggplot2)
+library(ggfortify)
+library(tsdl)
+library(forecast)
+library(fpp2)
+
+# read in data from csv file   
+data <- read.csv("SAF.csv")            
+filtered_data <- data %>%
+ filter(FuelCategory == "Non-ester Renewable Diesel (EV 1.6)")
+```
+
+```{r}
+df = subset(data, select = c(Year, Month, Volume) )
+
+# create 'Date' variable and average volume
+df$Date <- with(df, sprintf("%d-%02d", Year, Month))
+df = subset(df, select = c(Date, Volume))
+df$Volume <- gsub("[^0-9.-]", "", df$Volume)
+df$Volume <- as.numeric(df$Volume)
+df$Volume <- as.integer(df$Volume)
+
+new_dat <- df %>%
+  group_by(Date) %>%
+  summarise(Volume = (mean(Volume)))
+(new_dat)
+
+
+```
+
+```{r}
+# create and plot time series object
+tSeries <- ts(new_dat$Volume)
+ts.plot(tSeries)
+fit <- lm(tSeries ~ as.numeric(1:length(tSeries))) 
+abline(fit, col="red") 
+abline(h=mean(tSeries), col="blue")
+```
+
+Visualizing the time series data as a plot, a slight downward trend is apparent. Additionally, there is observable seasonality, characterized by cyclic variations in the graph's curvature. Additionally, the variance appears to exhibit a marginal decrease over the range of years. It is important to note the downward peak around the 120th observation which might affect the general linear trend when forecasting.
+
+## Partition Data into Train and Test Sets
+
+To begin with the analysis, we want to create a training and testing data set for the model to be trained on and tested on for performance. The training set will be used to train our models on, while the testing set will serve as new data for our models to be tested on.
+
+I decided to use a 75/30 split, with 75% of the data used for training and 25% of the data used for testing. This will increase the model performance, while still maintaining a large proportion of data to test on.
+
+```{r}
+# Calculate the index to split the data
+split_index <- floor(length(tSeries) * 0.75)
+# Create training and testing sets
+train <- window(tSeries, end = split_index)
+test <- window(tSeries, start = split_index + 1)
+```
+
+Now, the training dataset is ready to be explored.
+
+## Data Exploration
+
+```{r}
+# work with training data
+# plot the time series with mean and trend
+ts.plot(train)
+fit <- lm(train ~ as.numeric(1:length(train)))
+abline(fit, col=" red")
+abline(h=mean(train), col="blue")
+```
+
+Based on the graph of the training data, there is a linear downward trend as indicated by the red trend line. Variance seems relatively constant only slightly decreasing through the progression of years. A notable feature of the graph is the sharp downward curve towards the end of the graph which might be shifting the trend line downward
+
+```{r echo=FALSE}
+# plot the histogram
+hist(train, col="blue", xlab="", main="Histogram - SAF Data")
+```
+
+From the histogram, there is a skew of mean observations to the right, as well as an outlier suggesting that the data is not Gaussian and requires transformation.
+
+Subsequently, to look at seasonality, we can look at the autocorrelation function of the training set.
+
+```{r echo=FALSE}
+# analyze acf of data to check for need of transformation
+acf(train,lag.max=40, main="ACF of the SAF Data")
+```
+
+The autocorrelation function exhibits a slow downward trend suggesting that the series is most likely nonstationary. In addition, the ACF is periodic as seen by cyclical curvature, suggesting that there is a seasonal component that needs to be differenced. To make the series stationary, we can explore some transformations.
+
+## Transformations
+
+We can start by Box-Cox transforming the data. This is a power transformation that can help attain normality, a condition required for SARIMA models.
+
+```{r echo = FALSE}
+# apply box cox transformation
+t = 1:length(train)
+fit = lm(train ~ t)
+bcTransform = boxcox(train ~ t,plotit = TRUE)
+
+lambda = bcTransform$x[which(bcTransform$y == max(bcTransform$y))]
+lambda
+train.bc = (1/lambda)*(train^lambda-1)
+```
+
+This plot shows the log-likelihood for a Box cox transformation across different lambda values. The optimal value of lambda here is -0.1414141. Since the optimal value and the confidence interval contains zero and does not contain 1 or negative vales, a Box-Cox transformation is most likely necessary to decrease variance. Since 0 is within the confidence interval and the optimal lambda value is close to zero, a log transformation is possible. We can test this by taking the log of the training set to log transform the data.
+
+```{r echo=FALSE}
+# apply log transformation
+train.log = log(train)
+```
+
+In order to see which model fits the best, I plotted the original data, box-cox transformed data, and log transformed data along with their corresponding histograms.
+
+```{r echo = FALSE}
+#plot original data, box-cox transformed data, and log transformed data
+par(mfrow = c(1, 3))
+ts.plot(train,main = "Original data",ylab = expression(X[t]))
+ts.plot(train.bc,main = "Box-Cox tranformed data", ylab = expression(Y[t]))
+ts.plot(train.log, main = "Log transformed data",ylab = expression(Z[t]))
+```
+
+The plot of the original data shows that variance increases as time increases, so it is not entirely normal and it is not stationary. The Box-Cox transformed data has a less change in variance through time so it is more normal. The log transformed data has less variability, and is similar in normality to Box-Cox transformed data.
+
+```{r echo = FALSE}
+par(mfrow = c(1, 3))
+# show histogram of original data, box-cox transformed data, and log transformed data
+hist(train,main = "Original data",ylab = expression(X[t]))
+hist(train.bc,main = "Box-Cox tranformed data", ylab = expression(Y[t]))
+hist(train.log,main = "Log transformed data", ylab = expression(Z[t]))
+```
+
+Looking at the plots, the box-cox transformed data is the ideal choice since it is the closest to being normal. It also has the lowest variance so the best option is the box-cox transformed data. Based on the histograms, the original data is the least normal while the Box-cox data is the most normal followed by the log transformed data although this is slightly skewed to the left. In order to see if this is the case, we can check the variance of the original data, box-cox transformed data, and log transformed data.
+
+```{r}
+# display variance of original data, box-cox transformed data, and log transformed data
+var(train)
+var(train.bc)
+var(train.log)
+```
+
+The variance of the Box-Cox transformed data is least which aligns with the observations of bothe the plots and the histograms. We can proceed to the differencing process using the Box-Cox Transformed data.
+
+Before we move on to the differencing process, it is important to look at the decomposition of the time series to see that it is in line with our observations.
+
+```{r echo=FALSE}
+# decomposition of time series data
+y <- ts(as.ts(train.bc), frequency = 12)
+decomp <- decompose(y)
+plot(decomp)
+```
+
+The need for the differencing process is evident through the above decomposition. There is a distinct downward trend and pronounced seasonality. Based on these findings, we can begin differencing the training set. This involves experimenting with both a seasonal difference at lag 12 to eliminate seasonality and a difference at lag 1 to address the linear trend.
+
+## Analyzing ACF and PACF
+
+```{r echo=FALSE}
+# ACF and variance of undifferenced train data
+par(mfrow = c(1, 3))
+
+acf(train.log, lag.max = 60, main = "ACF: Time Series")
+
+# ACF and variance of de-trended train data 
+train_diff_t = diff(train.log, 1)
+acf(train_diff_t, lag.max = 60, main = "ACF: Trend Differencing")
+
+# ACF and variance of de-seasonalized and de-trended train data 
+train_diff1 = diff(train_diff_t, 1)
+acf(train_diff1, lag.max = 60, main = "ACF: Seasonal/Trend Differencing")
+```
+
+Based on the ACF plots above, the ACF of the original time series displays both seasonality with a cyclic period and a downward pattern indicating a trend. It also exhibits a gradual decrease, suggesting nonstationarity. The detrended time series also looks random without seasonality or a gradual decrease.
+
+```{r}
+# check variance of original, trend differenced, and seasonal/trend differenced data
+var(train)
+var(train_diff_t)
+var(train_diff1)
+```
+
+We can examine the variances, which indicate that the series, when de-trended exhibits the least variance. When both detrended and deseasonalized the time sereies exhibits relatively low variance, but the de-trended series has both least variance as well as the most stationarity. We can use the de-trended series for the analysis.
+
+```{r echo=FALSE}
+# plot differenced data
+ts.plot(train_diff_t, main = "Differenced data", ylab = expression(X[t]))
+```
+
+```{r echo=FALSE}
+# histogram of differenced data
+hist(train_diff_t, density=20,breaks=20, col="blue", xlab="", prob=TRUE)
+m<-mean(train_diff_t)
+std<- sqrt(var(train_diff_t))
+curve(dnorm(x,m,std), add=TRUE )
+```
+
+From the above plots, the differenced data does seem to be random suggesting stationarity and the histogram is normally distributed. Thus, we can choose the series that is differenced at both 1 and 12.
+
+```{r echo=FALSE}
+# analyze acf and pacf of differenced data
+acf(train_diff_t, lag.max = 60, main = "ACF: Seasonal and Trend Differencing of Time Series")
+
+pacf(train_diff_t, lag.max=60, main="PACF: Seasonal and Trend Differencing of Log Transformed Time Series")
+```
+
+Now, we are ready to begin the process of model selection. From the ACF above, there are 3 MA components outside the confidence interval including either 1 or 2. This corresponds to the MA component where 1 and 2. There are no multiples of 12 that have significant lags. As a result we can test models with q =1 or 2, and Q= 0.
+
+Looking at the PACF which corresponds to the AR component, it seems that either at lag 1 the ACF value goes outside the confidence interval. This means we can choose p=1, 2, or 5, and P = 0. We differenced 1 time for both seasonality and trend so choose d = D = 1.
+
+## Model Selection
+
+```{r echo=FALSE}
+# fit 1 
+fit1 <- arima(train_diff_t, order = c(1, 1, 1), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit1)
+npar <- length(fit1$coef) + 1
+nstar <- length(fit1$residuals) - fit1$arma[6] - fit1$arma[7] * fit1$arma[5]
+aicc1 <- fit1$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc1
+autoplot(fit1)
+```
+
+These are the corresponding result from fitting a SARIMA(1, 1, 1)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -138.0665.
+
+```{r echo=FALSE}
+# fit 2
+fit2 <- arima(train_diff_t, order = c(2, 1, 1), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit2)
+npar <- length(fit2$coef) + 1
+nstar <- length(fit2$residuals) - fit2$arma[6] - fit2$arma[7] * fit2$arma[5]
+aicc2 <- fit2$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc2
+autoplot(fit2)
+```
+
+These are the corresponding result from fitting a SARIMA(2, 1, 1)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -148.0419.
+
+```{r echo=FALSE}
+# fit 3
+fit3 <- arima(train_diff_t, order = c(5, 1, 1), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit3)
+npar <- length(fit3$coef) + 1
+nstar <- length(fit3$residuals) - fit3$arma[6] - fit3$arma[7] * fit3$arma[5]
+aicc3 <- fit3$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc3
+autoplot(fit3)
+```
+
+These are the corresponding result from fitting a SARIMA(5, 1, 1)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -148.6936.
+
+```{r echo=FALSE}
+# fit 4
+fit4 <- arima(train_diff_t, order = c(1, 1, 2), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit4)
+npar <- length(fit4$coef) + 1
+nstar <- length(fit4$residuals) - fit4$arma[6] - fit4$arma[7] * fit4$arma[5]
+aicc4 <- fit4$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc4
+autoplot(fit4)
+```
+
+These are the corresponding result from fitting a SARIMA(1, 1, 2)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -156.7305.
+
+```{r echo=FALSE}
+# fit 5
+fit5 <- arima(train_diff_t, order = c(2, 1, 2), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit5)
+npar <- length(fit5$coef) + 1
+nstar <- length(fit5$residuals) - fit5$arma[6] - fit5$arma[7] * fit5$arma[5]
+aicc5 <- fit5$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc5
+autoplot(fit5)
+```
+
+These are the corresponding result from fitting a SARIMA(2, 1, 2)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -155.1167.
+
+```{r echo=FALSE}
+# fit 6
+fit6 <- arima(train_diff_t, order = c(5, 1, 2), seasonal = list(order = c(1, 1, 1), period = 12))
+summary(fit6)
+npar <- length(fit6$coef) + 1
+nstar <- length(fit6$residuals) - fit6$arma[6] - fit6$arma[7] * fit6$arma[5]
+aicc6 <- fit6$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aicc6
+autoplot(fit6)
+```
+
+These are the corresponding result from fitting a SARIMA(2, 1, 2)(1, 1, 1)12 model. The MA results of the autoplot shows that the model is invertible. The AICc is -152.8192.
+
+All of these models are invertible. However, the AICc is lowest for fit 4, followed by fit5 which have a corresponding AICc of -156.7305 and -155.1167. Looking at the coefficients for Model 1, ar2, ma1,sar1, and sma1 coefficients contain 0 in the confidence intervals. Additionally, for the next best fit- fit5, ar2, ar4, ar5, ma1, sar1, and sma1 contain 0 in the confidence intervals. To check for a better model, we can set these coefficients to 0 and check the resulting AICc.
+
+```{r  warning=FALSE}
+# set specific coefficients to 0 in the two best fits
+modelA <- arima(train_diff_t, 
+                order = c(2, 1, 2), 
+                seasonal = list(order = c(1, 1, 1), period = 12), 
+                fixed = c(NA, 0, NA, NA, 0, NA), 
+                method = "ML")
+
+summary(modelA)
+npar <- length(modelA$coef) + 1
+nstar <- length(modelA$residuals) - modelA$arma[6]-modelA$arma[7]*modelA$arma[5]
+aiccA <- modelA$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aiccA
+autoplot(modelA)
+
+modelB <- arima(train_diff_t, 
+                order = c(2, 1, 2), 
+                seasonal = list(order = c(1, 1, 1), period = 12), 
+                fixed = c(NA, 0, NA, NA, 0, NA), 
+                method = "ML")
+
+summary(modelB)
+npar <- length(modelB$coef) + 1
+nstar <- length(modelB$residuals) - modelB$arma[6]-modelB$arma[7]*modelB$arma[5]
+aiccB <- modelB$aic + 2 * npar * (nstar/(nstar - npar - 1) - 1)
+aiccB
+autoplot(modelB)
+```
+
+Both of the models with fixed parameters are not invertible so we can stick with fit4 and fit5 as the best models.
+
+### Diagnostic Checking
+
+First, we begin by working with fit4. We can check both the histogram of residuals to make sure that it is normal as well as the plot of residuals to ensure that there is no trend. Additionally the Q-Q plot can tell us if it is normal based if the observations follow a straight line.
+
+```{r echo=FALSE}
+# first work with fit4
+res <- residuals(fit4)
+hist(res, density=20,breaks=20, col="blue", xlab="", prob=TRUE)
+m <- mean(res)
+std <- sqrt(var(res))
+curve( dnorm(x,m,std), add=TRUE )
+plot.ts(res)
+fitt <- lm(res ~ as.numeric(1:length(res)))
+abline(fitt, col="red")
+abline(h=mean(res), col="blue")
+
+qqnorm(res, main= "Normal Q-Q Plot for fit4")
+qqline(res, col="blue")
+```
+
+From the above plots, the Q-Q plot and the residual plot display normality. However, the histogram is slightly skewed to the right. We can run diagnostic checks to check the results.
+
+```{r}
+# multple tests for normality checking
+shapiro.test(res)
+Box.test(res, lag = 12, type = c("Box-Pierce"), fitdf = 5)
+Box.test(res, lag = 12, type = c("Ljung-Box"), fitdf = 5)
+Box.test(res^2, lag = 12, type = c("Ljung-Box"), fitdf = 0)
+acf(res^2, lag.max=40)
+ar(res, aic = TRUE, order.max = NULL, method = c("yule-walker"))
+```
+
+This model passes diagnostic checking as all tests have a p-value above 0.05. Additionally, the ar model selected a model of order 0, which suggests that it is entirely normal. We can check model fit5 to see which one is better in terms of normality.
+
+```{r echo=FALSE}
+#now move onto fit5
+res2 <- residuals(fit5)
+hist(res2, density=20,breaks=20, col="blue", xlab="", prob=TRUE)
+m <- mean(res2)
+std <- sqrt(var(res2))
+curve(dnorm(x,m,std), add=TRUE )
+plot.ts(res2)
+fitt <- lm(res2 ~ as.numeric(1:length(res2)))
+abline(fitt, col="red")
+abline(h=mean(res2), col="blue")
+
+qqnorm(res2, main= "Normal Q-Q Plot for Model B")
+qqline(res2, col="blue")
+```
+
+From the above plots, the histogram and the plot of the residuals display normality. However, the Q-Q plot does not cover all the possibilities of points so it might not be entirely accurate. We can run diagnostic checks to check the results.
+
+```{r}
+# tests for normality in fit 2
+shapiro.test(res2)
+Box.test(res2, lag = 12, type = c("Box-Pierce"), fitdf = 5)
+Box.test(res2, lag = 12, type = c("Ljung-Box"), fitdf = 5)
+Box.test(res2^2, lag = 12, type = c("Ljung-Box"), fitdf = 0)
+acf(res2^2, lag.max=40)
+ar(res2, aic = TRUE, order.max = NULL, method = c("yule-walker"))
+```
+
+This model does not pass diagnostic checking as all tests do not have a p-value above 0.05.
+
+This means we should do choose fit4 as our final model.
+
+# Results
+
+### Algebraic Form
+
+Final Model for the original data: follows SARIMA(1,1,2)(1,1,1)12 model:
+
+$$
+(1 - 0.4568{(0.1095)}B + 0.0831{(0.1009)}B^2)(1 + 0.0663{(0.1460)}B^{12})Y_t = (1 + 1.8813{(0.0587)}B - 0.8925{(0.0579)}B^2)(1 + 0.7514{(0.1443)}B^{12})Z_t
+$$
+
+$$sigma^2 = 0.01118$$
+
+The final model had an error variance of 0.01118, indicating a strong fit to historical SAF data.
+
+Now that we have the final model that will be used, we can use it to forecast the SAF observations.
+
+## Forecasting
+
+We begin by fitting the model on the training data to predict the next 12 values.
+
+```{r}
+forecasted_values <- forecast(fit4, h = 24)
+plot(forecasted_values)
+
+```
+
+The above graph shows the forecasts for the normalized data with the corresponding confidence intervals so we need to convert it back to the original scale using an exponential function. These are the following forecasts on the original scale.
+
+```{r}
+# Reverse log transformation
+original_scale_forecasts <- exp(forecasted_values$mean)
+plot(original_scale_forecasts)
+```
+
+We can check the accuracy of our model by predicting the next 12 values of the training data and fitting to the original data.
+
+```{r}
+# fit on train data
+fit.A <- arima(train, order = c(1, 1, 2), seasonal = list(order = 
+c(1, 1, 1), period = 12), method="ML")
+
+forecast(fit.A)
+
+#predict on  train data
+pred.tr <- predict(fit.A, n.ahead = 12)
+U.tr= pred.tr$pred + 2*pred.tr$se
+L.tr= pred.tr$pred - 2* pred.tr$se
+ts.plot(train, xlim=c(1,length(train)+12), ylim = c(min(train), max(U.tr)))
+lines(U.tr, col="blue", lty="dashed")
+lines(L.tr, col="blue", lty="dashed")
+points((length(train)+1):(length(train)+12), pred.tr$pred, col="red")
+
+# fit on original data
+pred.orig <- (pred.tr$pred)
+U= (U.tr)
+L= (L.tr)
+ts.plot(new_dat, xlim = c(0,length(train)+12), ylim = c(0,max(U)), col="red")
+lines(U, col="blue", lty="dashed")
+lines(L, col="blue", lty="dashed")
+points((length(train)+1):(length(train)+12), pred.orig, col="black")
+```
+
+From the plot above, it is evident that the confidence interval does capture the essence of the dataset. However, the individual data points deviate slightly from the fitted line. This deviation can be attributed, in part, to the presence of noise and seasonality and the lack of complete normality of the original dataset, posing a challenge for accurate representation by a SARIMA model. Consequently, eliminating all noise from this model proves to be challenging. This model is better employed for predicting ranges within which future observations are likely to fall, rather than providing precise point predictions. We can now use this model to predict the next 2 years on the original data with some level of confidence.
+
+```{r}
+#make the original data in compatible form
+split_index <- floor(length(tSeries) * 1)
+new <- window(tSeries, end = split_index)
+
+# create fit
+fit.A <- arima(new, order = c(1, 1, 2), seasonal = list(order = 
+c(1, 1, 1), period = 12), method="ML")
+
+forecast(fit.A)
+
+#predict on original data
+pred.tr <- predict(fit.A, n.ahead = 24)
+U.tr= pred.tr$pred + 2*pred.tr$se
+L.tr= pred.tr$pred - 2* pred.tr$se
+ts.plot(new, xlim=c(1,length(new)+24), ylim = c(min(new), max(U.tr)))
+lines(U.tr, col="blue", lty="dashed")
+lines(L.tr, col="blue", lty="dashed")
+points((length(new)+1):(length(new)+24), pred.tr$pred, col="red")
+
+pred.orig <- (pred.tr$pred)
+U= (U.tr)
+L= (L.tr)
+ts.plot(new_dat, xlim = c(0,length(new)+24), ylim = c(0,max(U)), col="red")
+lines(U, col="blue", lty="dashed")
+lines(L, col="blue", lty="dashed")
+points((length(new)+1):(length(new)+24), pred.orig, col="black")
+
+title(main = "Forecasted SAF Production")
+
+```
+
+Based on the graph above, the predictions seem to follow a similar pattern to the previous 40 months with some stabilization in variance. The historical data has an overall downward trend with some fluctuations, suggesting noise and seasonality between the months.
+
+The forecasted values appear to be relatively stable, without a strong positive or negative trend. Additionally, the forecast has a relatively narrow confidence interval which suggests that the model expects the values to stay within the specific range and is relatively confident about this prediction. There is still some level of uncertainty, as indicated by the widening of the confidence interval over the forecast horizon. This makes sense since it is harder to predict precise measurements the further out the data goes.
+
+# Conclusion
+
+This project aimed to fit a SARIMA model for accurate predictions for the production of SAFs in the US. SARIMA(1,1,2)(1,1,1)12, determined through differencing and diagnostic checking, is represented by the following equation: $$
+(1 - 0.4568{(0.1095)}B + 0.0831{(0.1009)}B^2)(1 + 0.0663{(0.1460)}B^{12})Y_t = (1 + 1.8813{(0.0587)}B - 0.8925{(0.0579)}B^2)(1 + 0.7514{(0.1443)}B^{12})Z_t
+$$
+
+$$sigma^2 = 0.01118$$
+
+While the model effectively captures the general trend and seasonality, its performance is constrained by factors such as noise in the data, stemming from complexities in the multitude of factors that might delay the adoptions of SAFs that were challenging to accurately capture. Although individual data points did not precisely match the original data, the confidence interval successfully encompasses it, indicating a satisfactory level of accuracy.
+
+The forecasting accuracy proves suitable for ranges, of the production of SAFs highlighting the inherent uncertainty in predictions.
+
+The analysis of SAFs highlights the potential and limitations of these technologies in decarbonizing the aviation sector. The SARIMA model for SAF data captured seasonal trends and produced accurate short-term forecasts, indicating a stabilizing production trend. While SAF production is limited by its carbon emissions, it can be used as a means to transition from traditional jet fuels to cleaner alternatives such as green hydrogen.
