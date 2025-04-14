@@ -1,0 +1,549 @@
+---
+title: "Forecasting Green Hydrogen Until 2050"
+output:
+  html_document: default
+  pdf_document: default
+date: "2024-12-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Nikhita Kalluri
+
+### NASA Glenn Research Center, Graphics and Visualization Lab
+
+# Abstract
+
+This project aims to predict green hydrogen produced until the year 2050. In order to predict until 2050 for the quantity of green hydrogen that will be produced per year, this forecasting analysis uses the International Energy Agency's Green Hydrogen dataset which provides information about projects and the corersponding amounts of Hydrogen expected to be produced. An LSTM neural network was chosen due to its ability to handle long-term dependencies in sequential data and capture historical trends for future predictions. The data was scaled and transformed to ensure compatibility with the LSTM model. The neural network was designed with optimized layers tailored for sequential prediction. The model was then trained using the processed time series dataset. A loss function and optimizer were employed to iteratively evaluate and enhance the model's performance. Forecasting was performed on the training dataset to validate the model's predictive accuracy. Finally, predictions were generated on the original time series data to forecast green hydrogen production until 2050.
+
+# Introduction
+
+With the accelerating impacts of climate change and the increasing demand for aviation fuel, developing sustainable alternatives has become pertinent. Green hydrogen presents a promising solution as a completely clean source of aviation fuel. However, its widespread adoption faces several challenges, including hydrogen production and availability, storage solutions, fuel and infrastructure costs, technological advancements, and public perception. To explore the potential trajectory of green hydrogen production, it is essential to forecast future trends based on historical data. In this study, we utilize the IEA Green Hydrogen dataset. Key variables of interest include "Date_online," "Technology_electricity," "Product," and "Announced size," which provide important insights into the production of green hydrogen.
+
+# Methods
+
+## Read in Data
+
+To begin, the dataset is imported as an Excel file and filtered to include only entries labeled as "Dedicated renewable," as we are focusing exclusively on green hydrogen. Since the volume of hydrogen is presented in varying units, it is necessary to standardize all values to MW for consistent analysis. This standardization is achieved by parsing the units in each observation, applying appropriate conversion factors, and performing the required multiplication or division.
+
+Once the data is standardized, it is summarized by grouping observations by year, ensuring that each year is represented by a single value. This transformation allows for a clearer analysis of trends over time.
+
+```{r include=FALSE}
+# Load required libraries
+library(ggplot2)
+library(forecast)
+library(dplyr)
+library(stringr)
+library(xts)
+library(tidyr)
+library(astsa)
+library(na.tools)
+library(MASS)
+library(ggfortify)
+library(tsdl)
+library(fpp2)
+library(readxl)
+library(keras)
+library(tidyverse)
+library(timetk)
+library(tensorflow)
+```
+
+```{r}
+# read in and filter dataset by "Dedicated renewable"
+df <- read_excel("greenH2Data.xlsx")
+
+filtered_df <- subset(df, Technology_electricity == "Dedicated renewable")
+filtered_df
+
+filtered_df <- filtered_df %>% 
+  filter(!is.na(AnnouncedSize))
+
+```
+
+```{r}
+# Define conversion factors
+MW_per_GW <- 1000
+MW_per_kW <- 0.001
+
+# Function to handle both power and complex production units
+parse_announced_size <- function(entry) {
+  # Initialize results list
+  result <- list(MW = NA, Production = NA)
+  
+  # Check for power units and convert
+  if (grepl("GW", entry, ignore.case = TRUE)) {
+    result$MW <- as.numeric(str_extract(entry, "^[0-9.]+")) * MW_per_GW
+  } else if (grepl("MW", entry, ignore.case = TRUE)) {
+    result$MW <- as.numeric(str_extract(entry, "^[0-9.]+"))
+  } else if (grepl("kW", entry, ignore.case = TRUE)) {
+    result$MW <- as.numeric(str_extract(entry, "^[0-9.]+")) * MW_per_kW
+  } 
+  
+  # Check for production units
+  else if (grepl("Nm3/h|Nm³/h|t H2/y|kt H2/y|t H2/d|kg H2/d|million litres per year|litres per year|m3 H2/h|kt NH3/y", entry, ignore.case = TRUE)) {
+    result$Production <- entry  # Store entry in Production column
+  
+  } else if (grepl("kg H2/y|t MeOH|t NH3|kg H2/d|t H2/y|kt H2/y|kt NH3/y|kt MeOH/y|litres|m3/h|m³/h|t CO2|million litres", entry, ignore.case = TRUE)) {
+    result$Production <- entry  # Store entry in Production column
+    
+  }
+  
+  # Handle ranges (use the lower bound if it's a power unit)
+  if (grepl("-", entry) && !is.na(result$MW)) {
+    result$MW <- as.numeric(str_extract(entry, "^[0-9.]+"))
+  }
+  
+  # Return result list with MW and Production columns
+  return(result)
+}
+
+# Apply parsing function to each entry in AnnouncedSize
+parsed_data <- lapply(filtered_df$AnnouncedSize, parse_announced_size)
+
+# Extract MW and Production columns from parsed data
+filtered_df$MW <- sapply(parsed_data, function(x) x$MW)
+filtered_df$Production <- sapply(parsed_data, function(x) x$Production)
+
+# updated DataFrame
+print(filtered_df)
+```
+
+```{r}
+# Define energy conversion factors
+H2_density_kWh_per_Nm3 <- 3.54            # kWh per Nm³ of H2
+kerosene_density_kWh_per_litre <- 9.75    # kWh per litre of synthetic kerosene
+H2_energy_kWh_per_kg <- 33.33             # kWh per kg of H2
+hours_per_year <- 8760                    # hours in a year
+days_per_year <- 365                      # days in a year
+
+# Function to convert production to MW equivalent
+convert_to_MW <- function(mw, production) {
+  # If MW is already present, keep it as is
+  if (!is.na(mw)) {
+    return(mw)
+  }
+  
+  # Evaluate which production units
+  if (grepl("Nm3/h", production, ignore.case = TRUE)) {
+    # Convert Nm³/h of H2 to MW
+    rate_Nm3_per_hour <- sum(as.numeric(unlist(str_extract_all(production, "\\d+\\.?\\d*"))))
+    mw_equiv <- rate_Nm3_per_hour * H2_density_kWh_per_Nm3 / 1000
+  
+  } else if (grepl("million litres per year", production, ignore.case = TRUE)) {
+    # Convert million litres per year to MW
+    litres_per_year <- as.numeric(str_extract(production, "\\d+\\.?\\d*")) * 1e6
+    mw_equiv <- litres_per_year * kerosene_density_kWh_per_litre / (hours_per_year * 1000)
+  
+  } else if (grepl("kt H2/y", production, ignore.case = TRUE)) {
+    # Convert kilotons per year to MW
+    kt_per_year <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- kt_per_year * 1000 * H2_energy_kWh_per_kg / (hours_per_year * 1000)
+  
+  } else if (grepl("t H2/y", production, ignore.case = TRUE)) {
+    # Convert tons per year to MW
+    tonnes_per_year <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- tonnes_per_year * H2_energy_kWh_per_kg * 1000 / (hours_per_year * 1000)
+  
+  } else if (grepl("t H2/d", production, ignore.case = TRUE)) {
+    # Convert tons per day to MW
+    tonnes_per_day <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- tonnes_per_day * H2_energy_kWh_per_kg * 1000 / (24 * 1000)
+    
+  } else if (grepl("kg H2/d", production, ignore.case = TRUE)) {
+    # Convert kilograms per day to MW
+    kg_per_day <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- kg_per_day * H2_energy_kWh_per_kg / (24 * 1000)
+    
+  } else if (grepl("kt NH3/y", production, ignore.case = TRUE)) {
+    # Handling ammonia production, placeholder if separate conversion required (adjust accordingly if needed)
+    mw_equiv <- NA  # Placeholder, since NH3 requires specific handling not covered here
+  
+  } else if (grepl("kW", production, ignore.case = TRUE)) {
+    # Convert kW directly to MW
+    kw_value <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- kw_value / 1000
+  
+  } else if (grepl("W", production, ignore.case = TRUE) && !grepl("kW", production, ignore.case = TRUE)) {
+    # Convert W to MW
+    w_value <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- w_value / 1e6
+  
+  } else if (grepl("GW", production, ignore.case = TRUE)) {
+    # Convert GW to MW
+    gw_value <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- gw_value * 1000
+  
+  } else if (grepl("m3/h", production, ignore.case = TRUE)) {
+    # Convert m³/h of H2 to MW (assuming standard m³ density similar to Nm³ for simplicity)
+    rate_m3_per_hour <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- rate_m3_per_hour * H2_density_kWh_per_Nm3 / 1000
+
+  } else if (grepl("litres per year", production, ignore.case = TRUE)) {
+    # Convert litres of kerosene per year to MW if not in millions
+    litres_per_year <- as.numeric(str_extract(production, "\\d+\\.?\\d*"))
+    mw_equiv <- litres_per_year * kerosene_density_kWh_per_litre / (hours_per_year * 1000)
+  
+  } else {
+    mw_equiv <- NA  # Keep NA if unable to parse
+  }
+  
+  return(mw_equiv)
+}
+
+# Apply conversion function to  dataframe
+filtered_df$MW_Equivalent <- mapply(convert_to_MW, filtered_df$MW, filtered_df$Production)
+
+filtered_df
+
+filtered_df <- filtered_df %>% 
+  filter(!is.na(Date))
+
+filtered_df <- filtered_df %>% 
+  filter(!is.na(MW_Equivalent))
+
+filtered_df$MW_Equivalent <- as.numeric(filtered_df$MW_Equivalent)
+filtered_df$MW_Equivalent <- as.integer(filtered_df$MW_Equivalent)
+
+df = subset(filtered_df, select = c(Date, MW_Equivalent) )
+
+# Summarize data and remove rows where Date is 2043 (NA)
+new_dat <- filtered_df %>%
+  group_by(Date) %>%
+  summarise(MW_Equivalent = mean(MW_Equivalent)) %>%
+  filter(Date != 2043)
+new_dat
+```
+
+Once the dataset is preprocessed and ready to be used, we can understand the distribution of the data visually.
+
+```{r}
+# plot date vs MW
+ggplot(new_dat, aes(Date, MW_Equivalent)) + 
+  geom_point()
+
+```
+
+The plot above shows that the majority of green hydrogen production is concentrated between 2020 and 2040. Additionally, the growth during this period appears to follow an exponential trend. With this, we can proceed to analyze the data for forecasting.
+
+## Data Scaling and Transformation
+
+Now that we have an understanding of the data distribution, we can scale it for compatibility with the LSTM model.
+
+To improve the model's performance, the data is scaled into a standard normal distribution using the following factors:\
+- **scale_factors[1]**: Mean of the `MW_Equivalent` column.\
+- **scale_factors[2]**: Standard deviation of the `MW_Equivalent` column.
+
+These factors ensure the data is normalized with a mean of 0 and a standard deviation of 1. Additionally, it is important to verify that the standard deviation is not zero. If it is, the process will end with an error.
+
+```{r}
+# set scale factors to for mean and standard deviation
+scale_factors <- c(mean(new_dat$MW_Equivalent), sd(new_dat$MW_Equivalent))
+```
+
+```{r}
+# if standard deviation is greater than 0, scale the data - normalization
+if (scale_factors[2] > 0) {
+  scaled_train <- new_dat %>%
+      dplyr::select(MW_Equivalent) %>%
+      dplyr::mutate(MW_Equivalent = (MW_Equivalent - scale_factors[1]) / scale_factors[2])
+} else {
+  stop("Standard deviation is zero or NA. Cannot scale data.")
+}
+```
+
+The next step is to set the prediction and lag parameters. The **prediction** parameter specifies the number of steps to forecast. Since this data is annual, and there are 12 steps in a year, we set the prediction parameter to 12. The **lag** parameter represents the number of steps back the model needs to consider—the length of the historical data sequence required to identify patterns. In this case, lag is also set to 12.
+
+With these values defined, we create the `x_train_data` variable, which is a matrix of lag-length sequences. This process generates lagged sequences of input data for the LSTM. The resulting matrix is then converted into a 3D array, as required for LSTM input. The dimensions of this array are `(number of sequences, lag, 1 feature per timestep)`
+
+```{r}
+# set prediction and lag
+prediction <- 12
+lag <- prediction
+```
+
+```{r}
+scaled_train <- as.matrix(scaled_train)
+#print(dim(x_train_arr))  # Should match your lag and prediction lengths
+
+# lag the data 11 times and arrange that into columns
+x_train_data <- t(sapply(
+    1:(length(scaled_train) - lag - prediction + 1),
+    function(x) scaled_train[x:(x + lag - 1), 1]
+  ))
+
+if (any(is.na(scaled_train)) || any(is.infinite(scaled_train))) {
+  stop("Scaled training data contains NA or Inf values.")
+}
+ 
+# transform it into 3D form
+x_train_arr <- array(
+    data = as.numeric(unlist(x_train_data)),
+    dim = c(
+        nrow(x_train_data),
+        lag,
+        1
+    )
+)
+```
+
+Next, we proceed to create the target data, `y_train_arr`, for the LSTM. Each sequence in the `y_train_arr` array contains the prediction values corresponding to the input sequences. Following this, we extract the final prediction values from the dataset to use for testing purposes.
+
+```{r}
+# create the target data array
+y_train_data <- t(sapply(
+    (1 + lag):(length(scaled_train) - prediction + 1),
+    function(x) scaled_train[x:(x + prediction - 1)]
+))
+ 
+y_train_arr <- array(
+    data = as.numeric(unlist(y_train_data)),
+    dim = c(
+        nrow(y_train_data),
+        prediction,
+        1
+    )
+)
+```
+
+```{r}
+# create x_test by extracting final predictions from dataset
+x_test <- new_dat$MW_Equivalent[(nrow(scaled_train) - prediction + 1):nrow(scaled_train)]
+x_test
+```
+
+In order to have accurate predictions, we need to normalize and reshape the test data as well. The test data is scaled using the same `scale_factors` as the training data and then reshaped into a 3D tensor with a single sample. This process ensures consistency between the training and testing phases.
+
+```{r}
+# scale the data with same scaling factors as for training
+x_test_scaled <- (x_test - scale_factors[1]) / scale_factors[2]
+
+if (any(is.na(x_test_scaled)) || any(is.infinite(x_test_scaled))) {
+  stop("Test data contains invalid scaled values.")
+}
+# this time our array just has one sample, as we intend to perform one 12-months prediction
+x_pred_arr <- array(
+    data = x_test_scaled,
+    dim = c(
+        1,
+        lag,
+        1
+    )
+)
+```
+
+## Model Creation
+
+The Long Short-Term Memory model is implemented using the Keras library to predict green hydrogen production. The following steps outline the architecture and setup of the model.
+
+We begin with defining the model architecture. The model includes two LSTM layers, each containing 50 units, or neurons. The input dimensions for the LSTM layers are specified using `batch_input_shape = c(1, 12, 1)`, where the batch size is set to 1—which is required for stateful training, timesteps are set to 12 for lag, and features are set to 1 because there is a single feature—`MW_Equivalent`. The `return_sequences = TRUE` parameter ensures that each LSTM layer outputs a sequence, allowing subsequent layers to process the complete temporal structure while `stateful = TRUE` enables the LSTM to retain memory of current states across batches, which is critical for capturing patterns in sequential data.
+
+To prevent overfitting to training data, dropout layers are included after each LSTM layer, using `layer_dropout(rate = 0.5)`. These layers randomly deactivate 50% of the neurons during training, improving the model's generalization. Finally, a dense layer, applied to each timestep, outputs a single value for each timestep.
+
+```{r}
+# model creation - 2 layers; batch size 1, 12 timesteps, 1 feature; layer dropout rate- 0.5
+lstm_model <- keras_model_sequential() %>%
+  layer_lstm(units = 50, 
+             batch_input_shape = c(1, 12, 1),  # Specify batch_size, timesteps, features
+             return_sequences = TRUE,
+             stateful = TRUE) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_lstm(units = 50,
+             return_sequences = TRUE,
+             stateful = TRUE) %>%
+  layer_dropout(rate = 0.5) %>%
+  time_distributed(layer_dense(units = 1))
+
+```
+
+The next step is model compilation. This model uses the Mean Absolute Error as the loss function, which calculates the average absolute difference between the predicted and actual values. This is suitable for continuous data, such as green hydrogen production. For optimization, the Adam optimizer is used. Adam is an algorithm that adjusts learning rates dynamically during training, helping to speed up convergence and improve model performance. Accuracy is included as well as an additional measure of the model's performance, providing insights into how well the model's predictions align with the true values.
+
+```{r}
+# compile model using mae, adam optimizer, accuracy as a metric
+lstm_model %>%
+  compile(loss = 'mae', optimizer = 'adam', metrics = 'accuracy')
+```
+
+Now we can display a summary of the model that includes the number of layers, output shapes of each layer, and the total number of trainable parameters.
+
+```{r}
+# generate model sumary 
+summary(lstm_model)
+```
+
+Based on the summary results, we can see that the model consists of several layers, with the main components being two LSTM layers, each containing 50 units. The first LSTM layer outputs a 3D tensor with a batch size of 12 timesteps and 50 units, and it has 10,400 parameters. The second LSTM layer, which processes the output from the first LSTM, also outputs a 3D tensor with 12 timesteps and 50 units. This layer has 20,200 parameters, which highlights the complexity added by learning temporal dependencies from the previous layer. Both LSTM layers are followed by dropout layers that prevent overfitting by randomly deactivating half of the neurons during training.
+
+The final layer is a time-distributed dense layer that applies a fully connected layer to each timestep independently, producing a single output for each timestep. This layer has 51 parameters, including 50 weights for the 50 units and one bias term. In total, the model has 30,651 parameters, all of which can be trained. We can now move on to the fitting of the model.
+
+## Model Fitting
+
+To fit the model to the training data, the `fit()` function is used. The input data for the model is given by `x_train_arr`, while the target data, or the values the model is predicting, is given by `y_train_arr`. The model is trained with a batch size of 1, meaning that each sequence is individually processed. This is because in stateful LSTM models, it is important to maintain the state across batches. The training process runs for 20 epochs, allowing the model to iterate over the training dataset 20 times to learn the temporal patterns in the data. Additionally, shuffling is disabled, ensuring that the data is processed in sequential order to preserve the state of the LSTM across batches.
+
+```{r}
+# fit model to training data
+history <- lstm_model %>% fit(
+    x = x_train_arr,
+    y = y_train_arr,
+    batch_size = 1,
+    epochs = 20,
+    verbose = 1,
+    shuffle = FALSE
+)
+
+# extract the MAE values
+mae_values <- history$metrics$loss  # 'loss' corresponds to MAE as specified in `compile()`
+print(mae_values)
+```
+
+The MAE values range between 0.5 and 0.6, indicating that the model's predictions deviate only slightly from the ground truth. This suggests a reasonable level of accuracy, providing confidence in the model's predictions. With this level of performance, we can proceed to forecast future values.
+
+## Forecasting and Validation
+
+The forecasting and validation process begins with generating predictions from the trained LSTM model. The model uses the test data given by x_pred_arr to make a forecast, which is done using the predict() function. The predicted values, initially scaled, are stored in the lstm_forecast variable. To transform these predictions back to their original scale, the forecast is multiplied by the standard deviation (scale_factors[2]) and then adding the mean (scale_factors[1]). This process ensures that the forecasted values match the scale of the original data.
+
+```{r}
+
+lstm_forecast <- lstm_model %>%
+    predict(x_pred_arr, batch_size = 1) %>%
+    .[, , 1]
+ 
+# we need to rescale the data to restore the original values
+lstm_forecast <- lstm_forecast * scale_factors[2] + scale_factors[1]
+
+if (is.na(scale_factors[1]) || is.na(scale_factors[2]) || scale_factors[2] == 0) {
+  stop("Scale factors are invalid. Cannot rescale forecasts.")
+}
+
+```
+
+Next, the fitted values, which are the predictions made on the training data, are obtained using the predict() function on x_train_arr. These predictions are initially stored in the fitted variable, and if they have more than one timestep, the values are rearranged to form a continuous sequence. The fitted values are then rescaled to match the original scale of the data, similar to the forecasting step.
+
+```{r}
+# get fitted values using the predict function
+ fitted <- predict(lstm_model, x_train_arr, batch_size = 1) %>%
+     .[, , 1]
+```
+
+```{r}
+if (dim(fitted)[2] > 1) {
+    fit <- c(fitted[, 1], fitted[dim(fitted)[1], 2:dim(fitted)[2]])
+} else {
+    fit <- fitted[, 1]
+}
+ 
+# additionally we need to rescale the data
+fitted <- fit * scale_factors[2] + scale_factors[1]
+nrow(fitted)
+```
+
+To ensure that the fitted values align with the length of the dataset, `NA` values are prepended to the beginning of the `fitted` values to match the length of the original training data.
+
+```{r}
+# prepend NA values
+fitted <- c(rep(NA, 55), fitted)
+fitted
+```
+
+The `lstm_forecast` is then converted into a time series object using the `tk_ts()` function from the `timetk` package. The time series is created with a start year of 2040 and an end year of 2051, with a frequency of 1 since it's annual data. This time series represents the forecasted values for the years 2040 to 2051, which are the years that the model will be forecasting.
+
+```{r}
+# convert values to forecast to a time series object  
+lstm_forecast <- timetk::tk_ts(lstm_forecast,
+    start = c(2040),
+    end = c(2051),
+    frequency = 1
+)
+lstm_forecast
+```
+
+```{r}
+# convert previous values to time series package
+input_ts <- timetk::tk_ts(new_dat$MW_Equivalent, 
+    start = c(1965), 
+    end = c(2040), 
+    frequency = 1)
+```
+
+The lengths of the original time series data and the fitted values are checked using the length function to ensure that both datasets are compatible in size. The `forecast_list` is then created, which stores the forecasting method (LSTM), the forecasted values (`lstm_forecast`), the original time series data (`input_ts`), the fitted values (`fitted`), and the residuals, calculated as the difference between the original data and the fitted values. These residuals help evaluate the model's accuracy by measuring the errors in its predictions.
+
+```{r}
+# compare lengths of input and fit to make sure they are equal
+length(input_ts)
+length(fitted)
+```
+
+```{r}
+# generate list of forecasts
+forecast_list <- list(
+    model = NULL,
+    method = "LSTM",
+    mean = lstm_forecast,
+    x = input_ts,
+    fitted = fitted,
+    residuals = as.numeric(input_ts) - as.numeric(fitted)
+  )
+
+class(forecast_list) <- "forecast"
+forecast_list
+```
+
+# Results
+
+Now we forecast the output onto a graph so we can visualize the data. The observed values are blue and the predicted values are red. The `original_ts` is the actual observed data, `fitted_values` are the predictions made by the LSTM model on the training data, and `forecast_values` are the future predictions made by the model. These components are combined into a data frame, `plot_data`, which includes the `Date`, `Value`, and a categorical variable `Type` that distinguishes between the observed and forecasted data points. This data frame is then used to create a plot using ggplot2. The plot visualizes the original data and the forecasted values, with a line representing the trends in both datasets. This allows us to visualize the trends by comparing the original values and the forecasted values. 
+
+```{r}
+# Prepare time series data
+original_ts <- input_ts  # Original data as a time series
+fitted_values <- fitted  # Fitted values from the LSTM model
+forecast_values <- lstm_forecast  # Forecasted values
+
+# Original time range (1960 to 2000)
+start_date <- 1960
+end_date <- 2000
+
+# Stretch time range (1960 to 2000 to 1960 to 2040)
+stretch_start <- 1960
+stretch_end <- 2040
+
+# Normalize original time data (from 1960 to 2000) to [0, 1]
+normalized_dates <- (time(original_ts) - start_date) / (end_date - start_date)
+
+# Stretch the dates: Linearly map normalized_dates to new range [1960, 2040]
+stretched_dates <- normalized_dates * (stretch_end - stretch_start) + stretch_start
+
+# Keep the original forecast time range from 2000 to 2050 (no stretching)
+forecast_dates <- time(forecast_values)
+
+# Combine both the stretched original time data and the forecasted time data
+plot_data <- data.frame(
+  Date = c(stretched_dates, forecast_dates),
+  Value = c(as.numeric(original_ts), as.numeric(forecast_values)),
+  Type = c(rep("Observed", length(original_ts)), rep("Forecast", length(forecast_values)))
+)
+
+# Plot using ggplot2
+ggplot(plot_data, aes(x = Date, y = Value, color = Type)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(data = plot_data[plot_data$Type == "Forecast", ], aes(x = Date, y = Value), size = 2) +
+  labs(
+    title = "LSTM Model: Observed vs Forecasted Values",
+    x = "Time",
+    y = "MW_Equivalent",
+    color = "Legend"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("Observed" = "blue", "Forecast" = "red")) +
+  scale_x_continuous(limits = c(1960, 2050)) +  # Set x-axis limits from 1960 to 2050
+  theme(
+    text = element_text(size = 14),
+    legend.position = "top"
+  )
+```
+
+Based on the plot above, we observe a logarithmic growth pattern in green hydrogen production from 2040 to 2050. Initially, there is an exponential increase in production from 2040 to 2047, with values rising from approximately 1,600 MW to 2,900 MW. Beyond 2047, the growth begins to level off, stabilizing at around 3,300 MW.
+
+# Conclusion and Future Work
+
+The aim of this project was to analyze trends in green hydrogen production for the aviation sector over time. The model demonstrated reliable performance, with mean absolute error values ranging from 0.5 to 0.6, indicating only minor deviations between predicted values and the ground truth since the scale of values is in megawatts. This analysis shows a logarithmic growth pattern in green hydrogen production. This trend suggests an initial rapid increase in production, which might be attributed to the need to meet short-term demand and address climate change, followed by a stabilization phase due to constraints such as resource availability, technological limitations, economic feasibility, and supply chain challenges. The leveling off of production at approximately 3,200 MW indicates a sustainable level that the sector can maintain considering these limitations.
